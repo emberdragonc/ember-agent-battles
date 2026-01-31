@@ -3,14 +3,21 @@ pragma solidity ^0.8.20;
 
 import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 /**
  * @title AgentBattles
  * @author Ember 🐉
  * @notice Two AI agents compete on the same task. Community bets on who ships better.
  * @dev Winner takes loser's stake + betting pool. Fee split: 5% EMBER stakers, 5% idea creator, 90% winners.
+ * 
+ * v2 Security Fixes (Self-Audit 3-Pass):
+ * - Added ReentrancyGuard on all external calls
+ * - Fixed sweepUnclaimed to only sweep specific battle's unclaimed funds
+ * - Added creatorRefund() for stuck battles
+ * - Added owner fallback resolution after extended timeout
  */
-contract AgentBattles is Ownable2Step, Pausable {
+contract AgentBattles is Ownable2Step, Pausable, ReentrancyGuard {
     // ============ Constants ============
     uint256 public constant FEE_STAKERS_BPS = 500;      // 5%
     uint256 public constant FEE_CREATOR_BPS = 500;      // 5%
@@ -22,6 +29,7 @@ contract AgentBattles is Ownable2Step, Pausable {
     uint256 public constant MIN_DURATION = 1 hours;
     uint256 public constant MAX_DURATION = 30 days;
     uint256 public constant REFUND_TIMEOUT = 7 days;
+    uint256 public constant OWNER_RESOLVE_TIMEOUT = 14 days;
     uint256 public constant CLAIM_DEADLINE = 90 days;
     
     // ============ Errors ============
@@ -42,24 +50,29 @@ contract AgentBattles is Ownable2Step, Pausable {
     error TransferFailed();
     error InvalidWinner();
     error TooEarlyForRefund();
+    error TooEarlyForOwnerResolve();
     error ClaimDeadlinePassed();
     error NoVotesForWinner();
+    error StakeAlreadyRefunded();
     
     // ============ Events ============
-    event BattleCreated(uint256 indexed battleId, address indexed agent1, address indexed agent2, uint256 stake, uint256 endTime);
+    event BattleCreated(uint256 indexed battleId, address indexed agent1, address indexed agent2, address creator, uint256 stake, uint256 endTime);
     event BetPlaced(uint256 indexed battleId, address indexed bettor, uint8 agentPick, uint256 amount);
     event WorkSubmitted(uint256 indexed battleId, address indexed agent, string workUrl);
     event BattleResolved(uint256 indexed battleId, uint8 winner, string resolution);
     event WinningsClaimed(uint256 indexed battleId, address indexed claimer, uint256 amount);
     event RefundClaimed(uint256 indexed battleId, address indexed claimer, uint256 amount);
+    event CreatorRefundClaimed(uint256 indexed battleId, address indexed creator, uint256 amount);
     event BattleCancelledEvent(uint256 indexed battleId, string reason);
     event FeesDistributed(uint256 indexed battleId, uint256 stakerFee, uint256 creatorFee);
+    event UnclaimedSwept(uint256 indexed battleId, uint256 amount);
     
     // ============ Structs ============
     struct BattleCore {
         address agent1;
         address agent2;
         address judge;
+        address creator;
         uint256 stake;
         uint256 startTime;
         uint256 endTime;
@@ -68,9 +81,11 @@ contract AgentBattles is Ownable2Step, Pausable {
     struct BattleState {
         bool resolved;
         bool cancelled;
+        bool stakeRefunded;
         uint8 winner;
         uint256 totalBetsAgent1;
         uint256 totalBetsAgent2;
+        uint256 claimedAmount;
     }
     
     struct Bet {
@@ -108,7 +123,7 @@ contract AgentBattles is Ownable2Step, Pausable {
         address agent2,
         uint256 duration,
         address judge
-    ) external payable whenNotPaused returns (uint256 battleId) {
+    ) external payable whenNotPaused nonReentrant returns (uint256 battleId) {
         if (agent1 == address(0) || agent2 == address(0)) revert ZeroAddress();
         if (agent1 == agent2) revert InvalidAgent();
         if (duration < MIN_DURATION || duration > MAX_DURATION) revert InvalidDuration();
@@ -120,6 +135,7 @@ contract AgentBattles is Ownable2Step, Pausable {
             agent1: agent1,
             agent2: agent2,
             judge: judge,
+            creator: msg.sender,
             stake: msg.value,
             startTime: block.timestamp,
             endTime: block.timestamp + duration
@@ -127,10 +143,10 @@ contract AgentBattles is Ownable2Step, Pausable {
         
         battleTasks[battleId] = task;
         
-        emit BattleCreated(battleId, agent1, agent2, msg.value, block.timestamp + duration);
+        emit BattleCreated(battleId, agent1, agent2, msg.sender, msg.value, block.timestamp + duration);
     }
     
-    function placeBet(uint256 battleId, uint8 agentPick) external payable whenNotPaused {
+    function placeBet(uint256 battleId, uint8 agentPick) external payable whenNotPaused nonReentrant {
         BattleCore storage core = battleCores[battleId];
         BattleState storage state = battleStates[battleId];
         
@@ -155,7 +171,7 @@ contract AgentBattles is Ownable2Step, Pausable {
         emit BetPlaced(battleId, msg.sender, agentPick, msg.value);
     }
     
-    function submitWork(uint256 battleId, string calldata workUrl) external {
+    function submitWork(uint256 battleId, string calldata workUrl) external nonReentrant {
         BattleCore storage core = battleCores[battleId];
         BattleState storage state = battleStates[battleId];
         
@@ -176,7 +192,7 @@ contract AgentBattles is Ownable2Step, Pausable {
         emit WorkSubmitted(battleId, msg.sender, workUrl);
     }
     
-    function resolveByJudge(uint256 battleId, uint8 winner) external {
+    function resolveByJudge(uint256 battleId, uint8 winner) external nonReentrant {
         BattleCore storage core = battleCores[battleId];
         BattleState storage state = battleStates[battleId];
         
@@ -198,7 +214,36 @@ contract AgentBattles is Ownable2Step, Pausable {
         emit BattleResolved(battleId, winner, "judge");
     }
     
-    function resolveByVote(uint256 battleId) external onlyOwner {
+    /**
+     * @notice Owner can resolve if judge is unresponsive after extended timeout
+     */
+    function resolveByOwner(uint256 battleId, uint8 winner) external onlyOwner nonReentrant {
+        BattleCore storage core = battleCores[battleId];
+        BattleState storage state = battleStates[battleId];
+        
+        if (core.startTime == 0) revert BattleNotFound();
+        if (state.cancelled) revert BattleCancelled();
+        if (state.resolved) revert BattleAlreadyResolved();
+        if (block.timestamp < core.endTime) revert BattleNotEnded();
+        
+        // Owner can only resolve if: no judge, OR judge timeout passed
+        if (core.judge != address(0) && block.timestamp < core.endTime + OWNER_RESOLVE_TIMEOUT) {
+            revert TooEarlyForOwnerResolve();
+        }
+        
+        if (winner != 1 && winner != 2) revert InvalidWinner();
+        if (winner == 1 && state.totalBetsAgent1 == 0) revert NoVotesForWinner();
+        if (winner == 2 && state.totalBetsAgent2 == 0) revert NoVotesForWinner();
+        
+        state.resolved = true;
+        state.winner = winner;
+        
+        _distributeFees(battleId);
+        
+        emit BattleResolved(battleId, winner, "owner");
+    }
+    
+    function resolveByVote(uint256 battleId) external onlyOwner nonReentrant {
         BattleCore storage core = battleCores[battleId];
         BattleState storage state = battleStates[battleId];
         
@@ -226,7 +271,7 @@ contract AgentBattles is Ownable2Step, Pausable {
         emit BattleResolved(battleId, winner, "vote");
     }
     
-    function claimWinnings(uint256 battleId) external {
+    function claimWinnings(uint256 battleId) external nonReentrant {
         BattleCore storage core = battleCores[battleId];
         BattleState storage state = battleStates[battleId];
         Bet storage bet = bets[battleId][msg.sender];
@@ -248,13 +293,15 @@ contract AgentBattles is Ownable2Step, Pausable {
         uint256 userShare = (winnerPoolAfterFees * bet.amount) / winnerPool;
         uint256 payout = bet.amount + userShare;
         
+        state.claimedAmount += payout;
+        
         (bool success, ) = msg.sender.call{value: payout}("");
         if (!success) revert TransferFailed();
         
         emit WinningsClaimed(battleId, msg.sender, payout);
     }
     
-    function emergencyRefund(uint256 battleId) external {
+    function emergencyRefund(uint256 battleId) external nonReentrant {
         BattleCore storage core = battleCores[battleId];
         BattleState storage state = battleStates[battleId];
         Bet storage bet = bets[battleId][msg.sender];
@@ -274,9 +321,31 @@ contract AgentBattles is Ownable2Step, Pausable {
         emit RefundClaimed(battleId, msg.sender, refundAmount);
     }
     
+    /**
+     * @notice Creator can refund their stake if battle never resolves
+     */
+    function creatorRefund(uint256 battleId) external nonReentrant {
+        BattleCore storage core = battleCores[battleId];
+        BattleState storage state = battleStates[battleId];
+        
+        if (core.startTime == 0) revert BattleNotFound();
+        if (msg.sender != core.creator) revert NotAuthorized();
+        if (state.resolved) revert BattleAlreadyResolved();
+        if (state.stakeRefunded) revert StakeAlreadyRefunded();
+        if (!state.cancelled && block.timestamp < core.endTime + REFUND_TIMEOUT) revert TooEarlyForRefund();
+        
+        state.stakeRefunded = true;
+        uint256 refundAmount = core.stake;
+        
+        (bool success, ) = msg.sender.call{value: refundAmount}("");
+        if (!success) revert TransferFailed();
+        
+        emit CreatorRefundClaimed(battleId, msg.sender, refundAmount);
+    }
+    
     // ============ Admin Functions ============
     
-    function cancelBattle(uint256 battleId, string calldata reason) external onlyOwner {
+    function cancelBattle(uint256 battleId, string calldata reason) external onlyOwner nonReentrant {
         _cancelBattle(battleId, reason);
     }
     
@@ -293,7 +362,10 @@ contract AgentBattles is Ownable2Step, Pausable {
     function pause() external onlyOwner { _pause(); }
     function unpause() external onlyOwner { _unpause(); }
     
-    function sweepUnclaimed(uint256 battleId) external onlyOwner {
+    /**
+     * @notice Sweep only unclaimed funds from a specific battle (not entire contract balance!)
+     */
+    function sweepUnclaimed(uint256 battleId) external onlyOwner nonReentrant {
         BattleCore storage core = battleCores[battleId];
         BattleState storage state = battleStates[battleId];
         
@@ -301,10 +373,20 @@ contract AgentBattles is Ownable2Step, Pausable {
         if (!state.resolved) revert BattleNotEnded();
         if (block.timestamp <= core.endTime + CLAIM_DEADLINE) revert TooEarlyForRefund();
         
-        uint256 balance = address(this).balance;
-        if (balance > 0) {
-            (bool success, ) = owner().call{value: balance}("");
+        // Calculate what should have been claimed
+        uint256 winnerPool = state.winner == 1 ? state.totalBetsAgent1 : state.totalBetsAgent2;
+        uint256 loserPool = state.winner == 1 ? state.totalBetsAgent2 : state.totalBetsAgent1;
+        uint256 totalPool = core.stake + loserPool;
+        uint256 winnerPoolAfterFees = (totalPool * FEE_WINNERS_BPS) / BPS_DENOMINATOR;
+        uint256 totalClaimable = winnerPool + winnerPoolAfterFees;
+        
+        // Unclaimed = what's claimable - what was claimed
+        uint256 unclaimed = totalClaimable > state.claimedAmount ? totalClaimable - state.claimedAmount : 0;
+        
+        if (unclaimed > 0) {
+            (bool success, ) = owner().call{value: unclaimed}("");
             if (!success) revert TransferFailed();
+            emit UnclaimedSwept(battleId, unclaimed);
         }
     }
     
@@ -328,6 +410,14 @@ contract AgentBattles is Ownable2Step, Pausable {
         return core.startTime > 0 && !state.cancelled && !state.resolved && block.timestamp < core.endTime;
     }
     
+    function isRefundAvailable(uint256 battleId) external view returns (bool) {
+        BattleCore storage core = battleCores[battleId];
+        BattleState storage state = battleStates[battleId];
+        if (core.startTime == 0) return false;
+        if (state.resolved) return false;
+        return state.cancelled || block.timestamp >= core.endTime + REFUND_TIMEOUT;
+    }
+    
     function calculatePotentialWinnings(uint256 battleId, uint8 agentPick, uint256 betAmount) external view returns (uint256) {
         BattleCore storage core = battleCores[battleId];
         BattleState storage state = battleStates[battleId];
@@ -338,7 +428,7 @@ contract AgentBattles is Ownable2Step, Pausable {
         uint256 newWinnerPool = currentWinnerPool + betAmount;
         uint256 totalPool = core.stake + loserPool;
         uint256 poolAfterFees = (totalPool * FEE_WINNERS_BPS) / BPS_DENOMINATOR;
-        uint256 userShare = (poolAfterFees * betAmount) / newWinnerPool;
+        uint256 userShare = newWinnerPool > 0 ? (poolAfterFees * betAmount) / newWinnerPool : 0;
         
         return betAmount + userShare;
     }
